@@ -1,0 +1,349 @@
+import { useState, useCallback } from "react";
+import * as XLSX from "xlsx";
+
+const MONTHS_PT = {
+  janeiro:0,fevereiro:1,"março":2,marco:2,abril:3,maio:4,junho:5,
+  julho:6,agosto:7,setembro:8,outubro:9,novembro:10,dezembro:11
+};
+const MONTH_NAMES = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho",
+  "Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"];
+const DAY_NAMES = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
+
+const SCHEDULE = {
+  1:[{turno:"Tarde", vagas:3,novas:0}],
+  2:[{turno:"Manhã", vagas:3,novas:0},{turno:"Tarde",vagas:1,novas:2}],
+  3:[{turno:"Manhã", vagas:1,novas:2},{turno:"Tarde",vagas:3,novas:0}],
+  4:[{turno:"Manhã", vagas:3,novas:0}],
+};
+
+function norm(s){ return String(s||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().trim(); }
+function fmtDate(d){ return d?.toLocaleDateString("pt-BR",{day:"2-digit",month:"2-digit",year:"numeric"})??"—"; }
+
+function parseObs(obs){
+  const s = String(obs||"");
+  let ultimaConsulta = null;
+  const dm = s.match(/[úu]ltima\s+consulta\s+(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?/i);
+  if(dm){
+    const d=parseInt(dm[1]), m=parseInt(dm[2])-1;
+    const y=dm[3]?(dm[3].length===2?2000+parseInt(dm[3]):parseInt(dm[3])):2025;
+    ultimaConsulta=new Date(y,m,d);
+  }
+  let mesRetorno=null;
+  const mm=s.match(/\b(janeiro|fevereiro|mar[çc]o|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\b/i);
+  if(mm) mesRetorno=MONTHS_PT[norm(mm[1])]??null;
+
+  let ausente = false;
+  if(ultimaConsulta !== null){
+    const idxMes = mm ? s.search(/\b(janeiro|fevereiro|mar[çc]o|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\b/i) : -1;
+    const idxUltima = s.search(/[úu]ltima\s+consulta/i);
+    if(idxMes === -1 || idxMes >= idxUltima) ausente = true;
+    if(ausente) mesRetorno = null;
+  }
+  return {mesRetorno, ultimaConsulta, ausente};
+}
+
+function parseIdade(s){
+  s=String(s||"");
+  const a=s.match(/(\d+)\s*ano/i); if(a) return parseInt(a[1]);
+  const m=s.match(/(\d+)\s*m[eê]s/i); if(m) return 0;
+  const n=parseInt(s); return isNaN(n)?null:n;
+}
+
+function parseXLSX(wb){
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const raw = XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
+  let hIdx=-1;
+  for(let i=0;i<raw.length;i++){
+    const r=raw[i].map(c=>norm(c));
+    if(r.some(c=>c==="paciente"||c.startsWith("paciente")) && r.some(c=>c==="idade"||c.startsWith("idade"))){hIdx=i;break;}
+  }
+  if(hIdx===-1) return {patients:[],rawHeaders:[],debugRows:raw.slice(0,8)};
+  const headers = raw[hIdx].map(c=>norm(c));
+  const colIdx=(kw)=>headers.findIndex(h=>h.includes(norm(kw)));
+  const iNome=colIdx("paciente"), iIdade=colIdx("idade"), iTel=colIdx("telefone"), iObs=colIdx("observa");
+  const patients=[];
+  for(let i=hIdx+1;i<raw.length;i++){
+    const row=raw[i];
+    if(row.every(c=>!String(c).trim())) continue;
+    const nome=String(row[iNome]||"").trim();
+    const idade=String(row[iIdade]||"").trim();
+    const tel=String(row[iTel]||"").trim();
+    const obs=String(row[iObs]||"").trim();
+    if(!nome||nome.length<3) continue;
+    if(!tel&&!idade) continue;
+    const nn=norm(nome);
+    if(["todos","observacoes","data inicial","data final"].some(s=>nn.includes(s))) continue;
+    const {mesRetorno,ultimaConsulta,ausente}=parseObs(obs);
+    patients.push({nome,idadeRaw:idade,idade:parseIdade(idade),telefone:tel,obs,mesRetorno,ultimaConsulta,ausente});
+  }
+  return {patients, rawHeaders:headers, debugRows:raw.slice(hIdx,hIdx+3)};
+}
+
+function getPart(date){
+  const d=date.getDate();
+  if(d<=5)return 0;if(d<=10)return 1;if(d<=15)return 2;
+  if(d<=20)return 3;if(d<=25)return 4;return 5;
+}
+const RANGES=[[1,5],[6,10],[11,15],[16,20],[21,25],[26,31]];
+
+function buildSlots(year,month){
+  const slots=[];
+  const days=new Date(year,month+1,0).getDate();
+  for(let d=1;d<=days;d++){
+    const date=new Date(year,month,d);
+    const dow=date.getDay();
+    if(SCHEDULE[dow]) SCHEDULE[dow].forEach(s=>slots.push({date:new Date(date),dow,turno:s.turno,vagas:s.vagas,novas:s.novas,patients:[]}));
+  }
+  return slots;
+}
+
+function allocate(patients,year,month){
+  const slots=buildSlots(year,month);
+  const totalDays=new Date(year,month+1,0).getDate();
+  const sorted=[...patients].sort((a,b)=>{
+    const pa=a.ultimaConsulta?getPart(a.ultimaConsulta):6;
+    const pb=b.ultimaConsulta?getPart(b.ultimaConsulta):6;
+    if(pa!==pb)return pa-pb;
+    return (a.idade??99)-(b.idade??99);
+  });
+  const placed=[],unplaced=[];
+  for(const p of sorted){
+    const part=p.ultimaConsulta?getPart(p.ultimaConsulta):0;
+    let[rS,rE]=RANGES[part]; rE=Math.min(rE,totalDays);
+    const pref=slots.filter(s=>{const d=s.date.getDate();return d>=rS&&d<=rE&&s.patients.length<s.vagas;});
+    const fall=slots.filter(s=>s.patients.length<s.vagas);
+    const tgt=pref[0]??fall[0]??null;
+    if(tgt){tgt.patients.push(p);placed.push({...p,slotDate:tgt.date,turno:tgt.turno});}
+    else unplaced.push(p);
+  }
+  return{slots,placed,unplaced};
+}
+
+export default function App(){
+  const[all,setAll]=useState([]);
+  const[year,setYear]=useState(new Date().getFullYear());
+  const[month,setMonth]=useState(new Date().getMonth());
+  const[result,setResult]=useState(null);
+  const[view,setView]=useState("lista");
+  const[error,setError]=useState("");
+  const[fileName,setFileName]=useState("");
+  const[preview,setPreview]=useState([]);
+  const[debug,setDebug]=useState(null);
+
+  const handleFile=useCallback(async(e)=>{
+    const file=e.target.files[0]; if(!file)return;
+    setFileName(file.name);setError("");setResult(null);setDebug(null);
+    try{
+      const buf=await file.arrayBuffer();
+      const wb=XLSX.read(buf);
+      const{patients,rawHeaders,debugRows}=parseXLSX(wb);
+      setDebug({rawHeaders,debugRows});
+      if(!patients.length){setError("Nenhum paciente encontrado. Veja o diagnóstico abaixo.");setAll([]);setPreview([]);return;}
+      setAll(patients);
+      setPreview(patients.slice(0,5));
+    }catch(err){setError("Erro: "+err.message);}
+  },[]);
+
+  const generate=()=>{
+    const retorno=all.filter(p=>p.mesRetorno===month&&!p.ausente);
+    if(!retorno.length){setError(`Nenhum paciente com retorno em ${MONTH_NAMES[month]}.`);setResult(null);return;}
+    setError("");
+    setResult(allocate(retorno,year,month));
+  };
+
+  const ausentes=all.filter(p=>p.ausente);
+  const card=(s={})=>({background:"#fff",border:"1px solid #e5e7eb",borderRadius:10,padding:20,marginBottom:16,...s});
+
+  const CalendarView=()=>{
+    if(!result)return null;
+    const daysInMonth=new Date(year,month+1,0).getDate();
+    const firstDow=new Date(year,month,1).getDay();
+    const cells=[...Array(firstDow).fill(null),...Array.from({length:daysInMonth},(_,i)=>i+1)];
+    const byDay={};
+    result.slots.forEach(s=>{const d=s.date.getDate();if(!byDay[d])byDay[d]=[];byDay[d].push(s);});
+    return(
+      <div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:2,marginBottom:4}}>
+          {DAY_NAMES.map(d=><div key={d} style={{textAlign:"center",fontSize:11,fontWeight:700,color:"#6b7280",padding:"4px 0"}}>{d}</div>)}
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:2}}>
+          {cells.map((d,i)=>{
+            const slots=d?byDay[d]:null;
+            const busy=slots?.some(s=>s.patients.length>0||s.novas>0);
+            return(
+              <div key={i} style={{minHeight:80,borderRadius:6,border:"1px solid #e5e7eb",background:d?(busy?"#f0fdf4":"#fafafa"):"transparent",padding:4,fontSize:10}}>
+                {d&&<div style={{fontWeight:700,color:busy?"#15803d":"#9ca3af",marginBottom:2}}>{d}</div>}
+                {slots?.map((s,si)=>(
+                  <div key={si} style={{marginBottom:3}}>
+                    <div style={{fontSize:9,fontWeight:700,color:"#6366f1",marginBottom:1}}>{s.turno}</div>
+                    {s.patients.map((p,pi)=>(
+                      <div key={pi} style={{background:"#dcfce7",borderRadius:3,padding:"1px 3px",marginBottom:1,color:"#166534",fontSize:9,lineHeight:1.3}}>
+                        {p.nome.split(" ")[0]} · {p.idadeRaw||`${p.idade}a`}
+                      </div>
+                    ))}
+                    {s.novas>0&&<div style={{background:"#fef9c3",borderRadius:3,padding:"1px 3px",color:"#854d0e",fontSize:9}}>🔓 {s.novas} nova{s.novas>1?"s":""}</div>}
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  return(
+    <div style={{fontFamily:"Inter,sans-serif",maxWidth:960,margin:"0 auto",padding:20,color:"#1f2937"}}>
+      <div style={{background:"linear-gradient(135deg,#6366f1,#8b5cf6)",borderRadius:12,padding:"20px 24px",marginBottom:20,color:"#fff"}}>
+        <h1 style={{margin:0,fontSize:20,fontWeight:700}}>📅 Projetor de Agendamento</h1>
+        <p style={{margin:"4px 0 0",fontSize:13,opacity:.85}}>Dra. Lívia · Lista de Espera</p>
+      </div>
+
+      <div style={card()}>
+        <h2 style={{margin:"0 0 14px",fontSize:15,fontWeight:700}}>1. Carregar lista de espera (.xlsx)</h2>
+        <label style={{display:"inline-block",background:"#6366f1",color:"#fff",padding:"8px 18px",borderRadius:8,cursor:"pointer",fontSize:13,fontWeight:600}}>
+          📂 Selecionar arquivo
+          <input type="file" accept=".xlsx,.xls" onChange={handleFile} style={{display:"none"}}/>
+        </label>
+        {fileName&&<span style={{marginLeft:12,fontSize:13,color:"#6b7280"}}>{fileName}</span>}
+        {error&&<p style={{margin:"10px 0 0",fontSize:13,color:"#dc2626"}}>⚠️ {error}</p>}
+        {all.length>0&&<p style={{margin:"10px 0 0",fontSize:13,color:"#15803d",fontWeight:600}}>✅ {all.length} pacientes carregados ({ausentes.length} ausentes)</p>}
+        {debug&&!all.length&&(
+          <div style={{marginTop:14,background:"#fef9c3",borderRadius:8,padding:12,fontSize:12}}>
+            <strong>🔍 Diagnóstico — colunas detectadas:</strong>
+            <div style={{marginTop:6,color:"#374151"}}>{debug.rawHeaders.join(" | ")||"(nenhuma)"}</div>
+            <strong style={{display:"block",marginTop:8}}>Primeiras linhas após cabeçalho:</strong>
+            {debug.debugRows.map((r,i)=><div key={i} style={{marginTop:4,color:"#6b7280"}}>{r.join(" | ")}</div>)}
+          </div>
+        )}
+        {preview.length>0&&(
+          <div style={{marginTop:14,overflowX:"auto"}}>
+            <p style={{margin:"0 0 6px",fontSize:12,color:"#6b7280",fontWeight:600}}>Prévia:</p>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+              <thead>
+                <tr style={{background:"#f3f4f6"}}>
+                  {["Nome","Idade","Telefone","Retorno","Última consulta","Ausente?"].map(h=>(
+                    <th key={h} style={{padding:"6px 8px",textAlign:"left",fontWeight:700,borderBottom:"1px solid #e5e7eb"}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {preview.map((p,i)=>(
+                  <tr key={i} style={{borderBottom:"1px solid #f3f4f6"}}>
+                    <td style={{padding:"6px 8px"}}>{p.nome}</td>
+                    <td style={{padding:"6px 8px"}}>{p.idadeRaw}</td>
+                    <td style={{padding:"6px 8px"}}>{p.telefone}</td>
+                    <td style={{padding:"6px 8px",fontWeight:600,color:p.mesRetorno!==null?"#4f46e5":"#dc2626"}}>
+                      {p.mesRetorno!==null?MONTH_NAMES[p.mesRetorno]:"—"}
+                    </td>
+                    <td style={{padding:"6px 8px"}}>{p.ultimaConsulta?fmtDate(p.ultimaConsulta):"Não detectada"}</td>
+                    <td style={{padding:"6px 8px",color:p.ausente?"#dc2626":"#15803d",fontWeight:600}}>{p.ausente?"Sim":"Não"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {all.length>0&&(
+        <div style={card()}>
+          <h2 style={{margin:"0 0 14px",fontSize:15,fontWeight:700}}>2. Selecionar mês de agendamento</h2>
+          <div style={{display:"flex",gap:12,flexWrap:"wrap",alignItems:"center"}}>
+            <select value={month} onChange={e=>setMonth(+e.target.value)} style={{padding:"8px 12px",borderRadius:8,border:"1px solid #d1d5db",fontSize:14}}>
+              {MONTH_NAMES.map((m,i)=><option key={i} value={i}>{m}</option>)}
+            </select>
+            <select value={year} onChange={e=>setYear(+e.target.value)} style={{padding:"8px 12px",borderRadius:8,border:"1px solid #d1d5db",fontSize:14}}>
+              {[2025,2026,2027].map(y=><option key={y} value={y}>{y}</option>)}
+            </select>
+            <button onClick={generate} style={{background:"#6366f1",color:"#fff",border:"none",borderRadius:8,padding:"8px 22px",fontSize:14,fontWeight:700,cursor:"pointer"}}>
+              Gerar Projeção
+            </button>
+          </div>
+          <p style={{margin:"10px 0 0",fontSize:12,color:"#6b7280"}}>
+            {all.filter(p=>p.mesRetorno===month&&!p.ausente).length} paciente(s) com retorno em {MONTH_NAMES[month]}
+          </p>
+        </div>
+      )}
+
+      {ausentes.length>0&&(
+        <div style={card({borderLeft:"4px solid #f59e0b"})}>
+          <h2 style={{margin:"0 0 12px",fontSize:15,fontWeight:700,color:"#b45309"}}>⚠️ Pacientes Ausentes ({ausentes.length})</h2>
+          <p style={{margin:"0 0 12px",fontSize:12,color:"#6b7280"}}>Esses pacientes não compareceram no mês previsto.</p>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+            <thead>
+              <tr style={{background:"#fef9c3"}}>
+                {["Nome","Idade","Telefone","Última consulta","Observações"].map(h=>(
+                  <th key={h} style={{padding:"6px 10px",textAlign:"left",fontWeight:700,borderBottom:"1px solid #fde68a"}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {ausentes.map((p,i)=>(
+                <tr key={i} style={{borderBottom:"1px solid #fef3c7"}}>
+                  <td style={{padding:"8px 10px",fontWeight:600}}>{p.nome}</td>
+                  <td style={{padding:"8px 10px"}}>{p.idadeRaw}</td>
+                  <td style={{padding:"8px 10px"}}>{p.telefone}</td>
+                  <td style={{padding:"8px 10px"}}>{p.ultimaConsulta?fmtDate(p.ultimaConsulta):"—"}</td>
+                  <td style={{padding:"8px 10px",color:"#6b7280",fontSize:12}}>{p.obs}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {result&&(
+        <div style={card()}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
+            <h2 style={{margin:0,fontSize:15,fontWeight:700}}>Projeção — {MONTH_NAMES[month]} {year}</h2>
+            <div style={{display:"flex",gap:8}}>
+              {["lista","calendario"].map(v=>(
+                <button key={v} onClick={()=>setView(v)} style={{padding:"6px 16px",borderRadius:8,border:"1px solid #6366f1",background:view===v?"#6366f1":"#fff",color:view===v?"#fff":"#6366f1",fontSize:13,fontWeight:600,cursor:"pointer"}}>
+                  {v==="lista"?"📋 Lista":"📅 Calendário"}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div style={{display:"flex",gap:10,marginBottom:16,flexWrap:"wrap"}}>
+            {[["#dcfce7","#166534",`✅ ${result.placed.length} alocados`],["#fef9c3","#854d0e","🔓 Vagas para novos"],
+              ...(result.unplaced.length?[["#fee2e2","#991b1b",`⚠️ ${result.unplaced.length} sem vaga`]]:[])]
+              .map(([bg,c,l])=><span key={l} style={{background:bg,color:c,fontSize:12,padding:"4px 12px",borderRadius:20,fontWeight:600}}>{l}</span>)}
+          </div>
+          {view==="lista"?(
+            <div>
+              {result.slots.filter(s=>s.patients.length>0||s.novas>0).map((s,i)=>(
+                <div key={i} style={{borderLeft:"3px solid #6366f1",paddingLeft:12,marginBottom:16}}>
+                  <div style={{fontWeight:700,fontSize:13,color:"#4f46e5",marginBottom:6}}>
+                    {s.date.toLocaleDateString("pt-BR",{weekday:"long"})} · {fmtDate(s.date)} · {s.turno}
+                  </div>
+                  {s.patients.map((p,pi)=>(
+                    <div key={pi} style={{background:"#f0fdf4",borderRadius:8,padding:"10px 14px",marginBottom:6,fontSize:13}}>
+                      <div style={{fontWeight:700}}>{p.nome}</div>
+                      <div style={{color:"#6b7280",marginTop:2}}>🎂 {p.idadeRaw} &nbsp;·&nbsp; 📞 {p.telefone} &nbsp;·&nbsp; 🗓 Última: {p.ultimaConsulta?fmtDate(p.ultimaConsulta):"—"}</div>
+                    </div>
+                  ))}
+                  {s.novas>0&&(
+                    <div style={{background:"#fef9c3",borderRadius:8,padding:"10px 14px",marginBottom:6,fontSize:13,color:"#854d0e"}}>
+                      🔓 {s.novas} vaga{s.novas>1?"s":""} reservada{s.novas>1?"s":""} para pacientes novos
+                    </div>
+                  )}
+                </div>
+              ))}
+              {result.unplaced.length>0&&(
+                <div style={{marginTop:20}}>
+                  <h3 style={{fontSize:14,color:"#dc2626",margin:"0 0 10px"}}>⚠️ Sem vaga — capacidade esgotada</h3>
+                  {result.unplaced.map((p,i)=>(
+                    <div key={i} style={{background:"#fee2e2",borderRadius:8,padding:"10px 14px",marginBottom:6,fontSize:13}}>
+                      <strong>{p.nome}</strong> · {p.idadeRaw} · 📞 {p.telefone}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ):<CalendarView/>}
+        </div>
+      )}
+    </div>
+  );
+}
